@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>GhostWire | Nexus</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        body { font-family: 'Outfit', sans-serif; background-color: #09090b; color: #e4e4e7; overflow: hidden; }
+        .mono { font-family: 'Space Mono', monospace; }
+        
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+
+        .glass { background: rgba(24, 24, 27, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.05); }
+        .msg-enter { animation: slideUp 0.2s cubic-bezier(0.16, 1, 0.3, 1); }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        /* Video Call Container */
+        .video-grid { display: grid; grid-template-columns: 1fr; gap: 0; height: 100%; position: relative; }
+        .local-video { position: absolute; bottom: 20px; right: 20px; width: 120px; border-radius: 12px; border: 2px solid #22c55e; box-shadow: 0 10px 20px rgba(0,0,0,0.5); z-index: 50; transition: all 0.3s; }
+        .remote-video { width: 100%; height: 100%; object-fit: cover; }
+        
+        /* Mobile handling for video */
+        @media (max-width: 640px) {
+            .local-video { width: 90px; bottom: 80px; right: 10px; }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // --- Constants ---
+        const MAX_SLOTS = 50; // Increase slots for more diversity
+        const FILE_LIMIT = 100 * 1024 * 1024; // 100MB
+
+        // --- Icons ---
+        const Icon = ({ name, size = 20, className = "", onClick }) => {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide) {
+                    window.lucide.createIcons({
+                        root: iconRef.current ? iconRef.current.parentNode : document,
+                        nameAttr: 'data-lucide',
+                        attrs: { class: `lucide lucide-${name} ${className}`, width: size, height: size }
+                    });
+                }
+            }, [name, size, className]);
+            return <i ref={iconRef} data-lucide={name} className={className} onClick={onClick}></i>;
+        };
+
+        // --- App Component ---
+        const App = () => {
+            // -- View State --
+            // 'setup' = Profile screen
+            // 'searching' = Looking for peer
+            // 'connected' = Chatting
+            // 'call' = Video call active
+            const [view, setView] = useState('setup');
+            const [scanText, setScanText] = useState('Initializing...');
+            
+            // -- User Profile & Prefs --
+            const [myGender, setMyGender] = useState('M');
+            const [myAge, setMyAge] = useState(25);
+            const [targetGender, setTargetGender] = useState('any'); // M, F, any
+            const [targetAgeMin, setTargetAgeMin] = useState(18);
+            const [targetAgeMax, setTargetAgeMax] = useState(99);
+
+            // -- Connection State --
+            const [peerId, setPeerId] = useState(null);
+            const [partnerData, setPartnerData] = useState(null); // { age, gender }
+            const [messages, setMessages] = useState([]);
+            
+            // -- Call State --
+            const [callActive, setCallActive] = useState(false);
+            const [localStream, setLocalStream] = useState(null);
+            const [remoteStream, setRemoteStream] = useState(null);
+            const [isVideoEnabled, setIsVideoEnabled] = useState(true);
+            const [isAudioEnabled, setIsAudioEnabled] = useState(true);
+
+            // -- Refs --
+            const peerRef = useRef(null);
+            const connRef = useRef(null);
+            const callRef = useRef(null);
+            const chatBoxRef = useRef(null);
+            const fileInputRef = useRef(null);
+            const localVideoRef = useRef(null);
+            const remoteVideoRef = useRef(null);
+
+            // -- Effects --
+            useEffect(() => {
+                if (chatBoxRef.current) chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
+            }, [messages]);
+
+            useEffect(() => {
+                if (localStream && localVideoRef.current) localVideoRef.current.srcObject = localStream;
+                if (remoteStream && remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
+            }, [localStream, remoteStream, callActive]);
+
+            // --- Logic: Matching ---
+            
+            const getPoolId = () => {
+                // Determine which "Frequency" to search
+                // Logic: Sort genders alphabetically to create a shared pool key
+                if (targetGender === 'any') return 'global';
+                
+                const genders = [myGender, targetGender].sort();
+                return `${genders[0]}${genders[1]}`; // e.g., 'FM', 'MM', 'FF'
+            };
+
+            const startSearch = useCallback(() => {
+                cleanupConnection();
+                setView('searching');
+                setMessages([]);
+                setPartnerData(null);
+                setScanText('Triangulating Frequency...');
+
+                const pool = getPoolId();
+                const slot = Math.floor(Math.random() * MAX_SLOTS) + 1;
+                const targetId = `gw-nx-${pool}-${slot}`;
+
+                console.log(`Searching in Pool: ${pool}, Slot: ${slot}`);
+
+                // Attempt to Host
+                const peer = new window.Peer(targetId, { debug: 1 });
+
+                peer.on('open', (id) => {
+                    // We are Host
+                    setPeerId(id);
+                    peerRef.current = peer;
+                    setScanText(`Hosting Channel ${slot}. Waiting...`);
+
+                    peer.on('connection', (c) => handleConnection(c, true));
+                    peer.on('call', (call) => handleIncomingCall(call));
+                });
+
+                peer.on('error', (err) => {
+                    if (err.type === 'unavailable-id') {
+                        // Slot taken -> We Connect (Client)
+                        setScanText(`Signal found in Slot ${slot}. Connecting...`);
+                        peer.destroy();
+                        connectToHost(targetId);
+                    } else {
+                        // Fatal error or disconnect
+                        console.error(err);
+                        setTimeout(startSearch, 1000); // Retry logic
+                    }
+                });
+            }, [myGender, targetGender, myAge]);
+
+            const connectToHost = (hostId) => {
+                const peer = new window.Peer();
+                
+                peer.on('open', (id) => {
+                    peerRef.current = peer;
+                    setPeerId(id);
+                    
+                    const conn = peer.connect(hostId);
+                    conn.on('open', () => handleConnection(conn, false));
+                    
+                    peer.on('call', (call) => handleIncomingCall(call));
+
+                    setTimeout(() => {
+                        if (!conn.open) startSearch(); // Retry if timeout
+                    }, 5000);
+                });
+                
+                peer.on('error', () => startSearch());
+            };
+
+            const cleanupConnection = () => {
+                if (callRef.current) callRef.current.close();
+                if (connRef.current) connRef.current.close();
+                if (peerRef.current) peerRef.current.destroy();
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    setLocalStream(null);
+                }
+                setRemoteStream(null);
+                setCallActive(false);
+            };
+
+            // --- Logic: Handshake & Chat ---
+
+            const handleConnection = (conn, amIHost) => {
+                connRef.current = conn;
+                
+                // 1. Send Handshake immediately
+                conn.send({
+                    type: 'handshake',
+                    payload: { age: myAge, gender: myGender }
+                });
+
+                conn.on('data', (data) => {
+                    if (data.type === 'handshake') {
+                        // 2. Validate Partner
+                        const { age, gender } = data.payload;
+                        
+                        // Check Criteria
+                        const ageValid = age >= targetAgeMin && age <= targetAgeMax;
+                        // Gender is already checked via Pool ID, but double check for 'any' pools
+                        const genderValid = targetGender === 'any' ? true : gender === targetGender;
+
+                        if (ageValid && genderValid) {
+                            // Match!
+                            setPartnerData({ age, gender });
+                            setView('connected');
+                            addSystemMsg(`Connected to Stranger (${gender}, ${age}y/o).`);
+                        } else {
+                            // No Match
+                            conn.send({ type: 'disconnect', reason: 'criteria' });
+                            addSystemMsg(`Criteria mismatch (${gender}, ${age}). Skipping...`);
+                            setTimeout(startSearch, 1000);
+                        }
+                    } else if (data.type === 'disconnect') {
+                        addSystemMsg('Stranger disconnected.');
+                        setTimeout(startSearch, 1000);
+                    } else if (data.type === 'msg') {
+                        addMessage(data.content, 'partner', 'text');
+                    } else if (data.type === 'file-start') {
+                        addMessage('Receiving file...', 'system');
+                    } else if (data.type === 'file-data') {
+                        receiveFile(data);
+                    }
+                });
+
+                conn.on('close', () => {
+                    addSystemMsg('Connection lost.');
+                    setTimeout(startSearch, 1500);
+                });
+            };
+
+            // --- Logic: Calls ---
+
+            const startCall = async (video = true) => {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: video, audio: true });
+                    setLocalStream(stream);
+                    setCallActive(true);
+                    
+                    const call = peerRef.current.call(connRef.current.peer, stream);
+                    handleCallStream(call);
+                } catch (err) {
+                    alert('Could not access camera/mic: ' + err.message);
+                }
+            };
+
+            const handleIncomingCall = (call) => {
+                const accept = confirm("Stranger is requesting a call. Accept?");
+                if (!accept) {
+                    call.close();
+                    return;
+                }
+
+                navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+                    .then((stream) => {
+                        setLocalStream(stream);
+                        setCallActive(true);
+                        call.answer(stream); // Answer with our stream
+                        handleCallStream(call);
+                    })
+                    .catch(err => {
+                        console.error('Failed to get local stream', err);
+                        // Can answer with audio only if video fails
+                        call.close();
+                    });
+            };
+
+            const handleCallStream = (call) => {
+                callRef.current = call;
+                call.on('stream', (remoteStream) => {
+                    setRemoteStream(remoteStream);
+                });
+                call.on('close', () => {
+                    setCallActive(false);
+                    setRemoteStream(null);
+                });
+            };
+
+            const endCall = () => {
+                if(callRef.current) callRef.current.close();
+                if(localStream) {
+                    localStream.getTracks().forEach(t => t.stop());
+                    setLocalStream(null);
+                }
+                setCallActive(false);
+            };
+
+            // --- Logic: Files ---
+
+            const handleFileSelect = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                if (file.size > FILE_LIMIT) {
+                    alert('File too large. Max 100MB.');
+                    return;
+                }
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const blob = new Blob([event.target.result], { type: file.type });
+                    
+                    // Display local
+                    const url = URL.createObjectURL(blob);
+                    addMessage({ url, type: file.type, name: file.name }, 'me', 'file');
+
+                    // Send (Basic implementation - sending whole buffer)
+                    // Note: For 100MB, chunking is better, but this fits the single-file constraint.
+                    connRef.current.send({
+                        type: 'file-data',
+                        file: event.target.result, // ArrayBuffer
+                        mime: file.type,
+                        name: file.name
+                    });
+                };
+                reader.readAsArrayBuffer(file);
+            };
+
+            const receiveFile = (data) => {
+                const blob = new Blob([data.file], { type: data.mime });
+                const url = URL.createObjectURL(blob);
+                addMessage({ url, type: data.mime, name: data.name }, 'partner', 'file');
+            };
+
+            // --- Helpers ---
+
+            const addMessage = (content, sender, type = 'text') => {
+                setMessages(prev => [...prev, { id: Date.now() + Math.random(), content, sender, type }]);
+            };
+
+            const addSystemMsg = (text) => addMessage(text, 'system');
+
+            const sendMessage = (e) => {
+                e.preventDefault();
+                const form = e.target;
+                const input = form.elements.msg;
+                const text = input.value.trim();
+                if (!text) return;
+
+                addMessage(text, 'me');
+                if (connRef.current) connRef.current.send({ type: 'msg', content: text });
+                input.value = '';
+            };
+
+            // --- Render ---
+
+            if (view === 'setup') {
+                return (
+                    <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-black to-zinc-900">
+                        <div className="w-full max-w-md glass rounded-2xl p-8 space-y-6">
+                            <div className="text-center space-y-2">
+                                <div className="inline-flex p-3 rounded-full bg-green-500/10 mb-2">
+                                    <Icon name="ghost" className="text-green-500" size={32} />
+                                </div>
+                                <h1 className="text-3xl font-bold tracking-tight text-white">GhostWire <span className="text-green-500 text-lg mono">NEXUS</span></h1>
+                                <p className="text-zinc-400 text-sm">Serverless Encrypted Matching</p>
+                            </div>
+
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="block text-xs font-semibold text-zinc-500 uppercase mb-2">I am a...</label>
+                                        <div className="flex bg-zinc-900/50 p-1 rounded-lg border border-zinc-800">
+                                            {['M', 'F'].map(g => (
+                                                <button key={g} onClick={() => setMyGender(g)} className={`flex-1 py-2 rounded-md text-sm font-bold transition-all ${myGender === g ? 'bg-zinc-700 text-white shadow' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                                                    {g}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-semibold text-zinc-500 uppercase mb-2">Age</label>
+                                        <input type="number" value={myAge} onChange={e => setMyAge(Number(e.target.value))} className="w-full bg-zinc-900 border border-zinc-800 rounded-lg py-2 px-3 text-white focus:border-green-500 focus:outline-none" />
+                                    </div>
+                                </div>
+
+                                <div className="border-t border-zinc-800/50 pt-4">
+                                    <label className="block text-xs font-semibold text-green-500 uppercase mb-2">Looking For...</label>
+                                    <div className="grid grid-cols-3 gap-2 mb-4">
+                                        {['M', 'F', 'any'].map(g => (
+                                            <button key={g} onClick={() => setTargetGender(g)} className={`py-2 rounded-lg border text-sm font-medium transition-all ${targetGender === g ? 'bg-green-500/10 border-green-500 text-green-400' : 'bg-zinc-900/50 border-zinc-800 text-zinc-500 hover:border-zinc-600'}`}>
+                                                {g.toUpperCase()}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    
+                                    <div className="flex items-center gap-2">
+                                        <input type="number" value={targetAgeMin} onChange={e => setTargetAgeMin(Number(e.target.value))} className="w-20 bg-zinc-900 border border-zinc-800 rounded-lg py-2 px-3 text-center text-sm" />
+                                        <span className="text-zinc-500 text-xs">TO</span>
+                                        <input type="number" value={targetAgeMax} onChange={e => setTargetAgeMax(Number(e.target.value))} className="w-20 bg-zinc-900 border border-zinc-800 rounded-lg py-2 px-3 text-center text-sm" />
+                                        <span className="text-zinc-500 text-xs ml-2">Y/O</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <button onClick={startSearch} className="w-full bg-green-600 hover:bg-green-500 text-black font-bold py-4 rounded-xl transition-all active:scale-95 flex items-center justify-center gap-2">
+                                <Icon name="radar" size={20} />
+                                CONNECT
+                            </button>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (view === 'searching') {
+                return (
+                    <div className="h-screen flex flex-col items-center justify-center bg-black relative overflow-hidden">
+                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-green-900/20 via-black to-black"></div>
+                        <div className="relative z-10 flex flex-col items-center space-y-8">
+                            <div className="w-32 h-32 relative">
+                                <div className="absolute inset-0 border-4 border-green-500/30 rounded-full animate-ping"></div>
+                                <div className="absolute inset-0 border-2 border-green-500 rounded-full flex items-center justify-center bg-black">
+                                    <Icon name="loader-2" size={40} className="text-green-500 animate-spin" />
+                                </div>
+                            </div>
+                            <div className="text-center">
+                                <h2 className="text-xl font-mono text-green-400 animate-pulse">{scanText}</h2>
+                                <p className="text-zinc-600 text-xs mt-2 mono">Searching public frequencies...</p>
+                            </div>
+                            <button onClick={() => setView('setup')} className="text-zinc-500 hover:text-white text-sm underline">Cancel</button>
+                        </div>
+                    </div>
+                );
+            }
+
+            // --- Chat View ---
+            return (
+                <div className="h-screen flex flex-col bg-black relative">
+                    
+                    {/* VIDEO OVERLAY (If Call Active) */}
+                    {callActive && (
+                        <div className="absolute inset-0 z-50 bg-black">
+                            <div className="video-grid">
+                                <video ref={remoteVideoRef} autoPlay playsInline className="remote-video" />
+                                <video ref={localVideoRef} autoPlay playsInline muted className="local-video" />
+                            </div>
+                            {/* Call Controls */}
+                            <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-black/50 backdrop-blur-md p-4 rounded-full border border-white/10">
+                                <button onClick={() => setCallActive(!callActive)} className="p-3 rounded-full bg-red-500 text-white hover:bg-red-600 transition-colors">
+                                    <Icon name="phone-off" />
+                                </button>
+                                {/* Mute/Video toggles could go here */}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Header */}
+                    <div className="h-16 border-b border-zinc-800 bg-zinc-900/80 backdrop-blur flex items-center justify-between px-4 shrink-0">
+                        <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-green-400 to-emerald-600 flex items-center justify-center text-black font-bold">
+                                {partnerData?.gender}
+                            </div>
+                            <div>
+                                <h3 className="font-bold text-white leading-none">Stranger</h3>
+                                <p className="text-xs text-zinc-500 mono mt-1">{partnerData?.age} Y/O • ENCRYPTED</p>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                             {!callActive && (
+                                <>
+                                    <button onClick={() => startCall(false)} className="p-2 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-full transition-colors"><Icon name="phone" /></button>
+                                    <button onClick={() => startCall(true)} className="p-2 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-full transition-colors"><Icon name="video" /></button>
+                                </>
+                            )}
+                            <button onClick={startSearch} className="ml-2 bg-zinc-800 hover:bg-zinc-700 text-white px-4 py-2 rounded-lg text-sm font-bold border border-zinc-700 transition-all flex items-center gap-2">
+                                <Icon name="skip-forward" size={16} />
+                                <span className="hidden sm:inline">SKIP</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Messages */}
+                    <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-4 space-y-4">
+                        {messages.map((msg) => {
+                            if (msg.type === 'system') {
+                                return <div key={msg.id} className="text-center text-[10px] text-zinc-600 uppercase tracking-widest my-4">― {msg.content} ―</div>;
+                            }
+                            const isMe = msg.sender === 'me';
+                            return (
+                                <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'} msg-enter`}>
+                                    <div className={`max-w-[75%] rounded-2xl p-3 ${isMe ? 'bg-green-600 text-white rounded-br-sm' : 'bg-zinc-800 text-zinc-200 rounded-bl-sm border border-zinc-700'}`}>
+                                        
+                                        {msg.type === 'text' && <p className="text-sm">{msg.content}</p>}
+                                        
+                                        {msg.type === 'file' && (
+                                            <div className="space-y-2">
+                                                {msg.content.type.startsWith('image/') ? (
+                                                    <img src={msg.content.url} className="rounded-lg max-h-60 object-cover" />
+                                                ) : msg.content.type.startsWith('video/') ? (
+                                                    <video src={msg.content.url} controls className="rounded-lg max-h-60 w-full" />
+                                                ) : (
+                                                    <div className="flex items-center gap-2 bg-black/20 p-2 rounded">
+                                                        <Icon name="file" />
+                                                        <span className="text-xs truncate">{msg.content.name}</span>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    {/* Input */}
+                    <div className="p-4 bg-zinc-900 border-t border-zinc-800">
+                        <form onSubmit={sendMessage} className="flex gap-2">
+                            <input 
+                                type="file" 
+                                ref={fileInputRef} 
+                                className="hidden" 
+                                onChange={handleFileSelect}
+                            />
+                            <button 
+                                type="button" 
+                                onClick={() => fileInputRef.current?.click()}
+                                className="p-3 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-xl transition-colors"
+                            >
+                                <Icon name="paperclip" />
+                            </button>
+                            <input 
+                                name="msg" 
+                                type="text" 
+                                placeholder="Type a message..." 
+                                className="flex-1 bg-black border border-zinc-700 rounded-xl px-4 text-white focus:border-green-500 focus:outline-none transition-colors"
+                                autoComplete="off"
+                            />
+                            <button type="submit" className="p-3 bg-green-600 text-black rounded-xl hover:bg-green-500 transition-colors">
+                                <Icon name="send-horizontal" />
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
+
+
