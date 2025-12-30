@@ -3,30 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>GhostWire | Nexus v2 (Debug)</title>
+    <title>GhostWire | Nexus v3 (Stable)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/lucide@latest"></script>
     <style>
-        body { font-family: 'Outfit', sans-serif; background-color: #09090b; color: #e4e4e7; overflow: hidden; }
+        body { font-family: 'Outfit', sans-serif; background-color: #000; color: #e4e4e7; overflow: hidden; }
         .mono { font-family: 'Space Mono', monospace; }
         
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 2px; }
-
-        .glass { background: rgba(24, 24, 27, 0.9); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.08); }
-        .msg-enter { animation: slideUp 0.2s cubic-bezier(0.16, 1, 0.3, 1); }
+        .glass { background: rgba(20, 20, 20, 0.95); border: 1px solid rgba(255,255,255,0.1); }
+        .msg-enter { animation: slideUp 0.2s ease-out; }
         @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
         .video-grid { display: grid; grid-template-columns: 1fr; gap: 0; height: 100%; position: relative; }
-        .local-video { position: absolute; bottom: 20px; right: 20px; width: 120px; border-radius: 12px; border: 2px solid #22c55e; box-shadow: 0 10px 20px rgba(0,0,0,0.5); z-index: 50; object-fit: cover; }
+        .local-video { position: absolute; bottom: 20px; right: 20px; width: 100px; border-radius: 8px; border: 2px solid #22c55e; z-index: 50; background: #000; }
         .remote-video { width: 100%; height: 100%; object-fit: cover; }
-        
-        /* Console Animation */
-        .console-slide { animation: slideInRight 0.3s ease-out forwards; }
-        @keyframes slideInRight { from { transform: translateX(100%); } to { transform: translateX(0); } }
     </style>
 </head>
 <body>
@@ -39,293 +31,256 @@
     <script type="text/babel">
         const { useState, useEffect, useRef, useCallback } = React;
 
-        // --- Config ---
-        // Reduced slots to increase collision chance for testing.
-        // Once popular, increase this number.
-        const MAX_SLOTS = 15; 
-        const HOST_TIMEOUT_MS = 6000; // If hosting for 6s and no one joins, retry new slot
-        const FILE_LIMIT = 100 * 1024 * 1024; 
+        // --- V3 CONFIGURATION ---
+        // Reduced to 5 to FORCE collisions during testing. 
+        // Once working, increase to 20.
+        const MAX_SLOTS = 5; 
+        
+        // Time to wait as host before jumping (10s)
+        const HOST_TIMEOUT_MS = 10000; 
+        
+        // Time to wait for a handshake before declaring "Zombie" (4s)
+        const CONNECT_TIMEOUT_MS = 4000;
 
-        // --- Icons ---
-        const Icon = ({ name, size = 20, className = "", onClick }) => {
-            const iconRef = useRef(null);
-            useEffect(() => {
-                if (window.lucide) {
-                    window.lucide.createIcons({
-                        root: iconRef.current ? iconRef.current.parentNode : document,
-                        nameAttr: 'data-lucide',
-                        attrs: { class: `lucide lucide-${name} ${className}`, width: size, height: size }
-                    });
-                }
-            }, [name, size, className]);
-            return <i ref={iconRef} data-lucide={name} className={className} onClick={onClick}></i>;
+        // STUN Configuration (Critical for Mobile Data)
+        const PEER_CONFIG = {
+            debug: 1,
+            config: {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    { urls: 'stun:stun2.l.google.com:19302' },
+                ]
+            }
         };
 
-        // --- Main App ---
+        const Icon = ({ name, size = 20, className = "" }) => {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons({ root: iconRef.current.parentNode, nameAttr: 'data-lucide', attrs: {class: `lucide lucide-${name} ${className}`, width: size, height: size} });
+            }, [name]);
+            return <i ref={iconRef} data-lucide={name} className={className}></i>;
+        };
+
         const App = () => {
             const [view, setView] = useState('setup');
-            const [scanText, setScanText] = useState('Initializing...');
+            const [status, setStatus] = useState('');
+            const [logs, setLogs] = useState([]);
             
-            // Profile
+            // User Data
             const [myGender, setMyGender] = useState('M');
             const [myAge, setMyAge] = useState(25);
             const [targetGender, setTargetGender] = useState('any');
-            const [targetAgeMin, setTargetAgeMin] = useState(18);
-            const [targetAgeMax, setTargetAgeMax] = useState(99);
 
-            // Connection
-            const [partnerData, setPartnerData] = useState(null);
+            // Session Data
             const [messages, setMessages] = useState([]);
-            
-            // Call
             const [callActive, setCallActive] = useState(false);
             const [localStream, setLocalStream] = useState(null);
             const [remoteStream, setRemoteStream] = useState(null);
-
-            // Debug Console State
-            const [showConsole, setShowConsole] = useState(false);
-            const [logs, setLogs] = useState([]);
 
             // Refs
             const peerRef = useRef(null);
             const connRef = useRef(null);
             const callRef = useRef(null);
-            const chatBoxRef = useRef(null);
-            const fileInputRef = useRef(null);
+            const hostTimerRef = useRef(null);
+            const connectTimerRef = useRef(null);
+            const isStoppedRef = useRef(false);
             const localVideoRef = useRef(null);
             const remoteVideoRef = useRef(null);
-            const hostTimeoutRef = useRef(null);
-            const isManualStopRef = useRef(false);
+            const ignoreListRef = useRef(new Set()); // Slots that failed recently
 
-            // --- Logging Helper ---
-            const addLog = (msg, type = 'info') => {
-                const timestamp = new Date().toLocaleTimeString().split(' ')[0];
-                setLogs(prev => [`[${timestamp}] ${msg}`, ...prev].slice(0, 50));
-                console.log(`[${type.toUpperCase()}] ${msg}`);
+            // --- Logging ---
+            const log = (msg, type='info') => {
+                const txt = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}`;
+                console.log(txt);
+                setLogs(p => [txt, ...p].slice(0, 20));
             };
 
-            // --- Effects ---
+            // --- Lifecycle ---
             useEffect(() => {
-                if (chatBoxRef.current) chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
-            }, [messages]);
-
-            useEffect(() => {
-                if (localStream && localVideoRef.current) localVideoRef.current.srcObject = localStream;
-                if (remoteStream && remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
+                if (localVideoRef.current && localStream) localVideoRef.current.srcObject = localStream;
+                if (remoteVideoRef.current && remoteStream) remoteVideoRef.current.srcObject = remoteStream;
             }, [localStream, remoteStream, callActive]);
 
-            // Cleanup on unmount
             useEffect(() => {
-                return () => cleanupConnection();
+                return () => shutdown();
             }, []);
 
-            // --- Core Logic: Search Cycle ---
+            // --- Core Logic ---
 
-            const getPoolId = () => {
+            const getPool = () => {
                 if (targetGender === 'any') return 'global';
-                const genders = [myGender, targetGender].sort();
-                return `${genders[0]}${genders[1]}`;
+                const g = [myGender, targetGender].sort();
+                return `${g[0]}${g[1]}`;
             };
 
-            const stopSearch = () => {
-                isManualStopRef.current = true;
-                cleanupConnection();
-                setView('setup');
-                addLog('Search stopped by user.', 'warn');
+            const shutdown = () => {
+                isStoppedRef.current = true;
+                if(hostTimerRef.current) clearTimeout(hostTimerRef.current);
+                if(connectTimerRef.current) clearTimeout(connectTimerRef.current);
+                if(callRef.current) callRef.current.close();
+                if(connRef.current) connRef.current.close();
+                if(peerRef.current) peerRef.current.destroy();
+                if(localStream) localStream.getTracks().forEach(t => t.stop());
+                setCallActive(false);
+                setLocalStream(null);
+                setRemoteStream(null);
+                setLogs([]);
             };
 
             const startSearch = useCallback(() => {
-                isManualStopRef.current = false;
-                cleanupConnection();
+                shutdown();
+                isStoppedRef.current = false;
                 setView('searching');
                 setMessages([]);
-                setPartnerData(null);
-                
-                attemptConnectionCycle();
+                ignoreListRef.current = new Set(); // Reset ignore list on new manual search
+                cycle();
             }, [myGender, targetGender]);
 
-            const attemptConnectionCycle = () => {
-                if (isManualStopRef.current) return;
+            const cycle = () => {
+                if (isStoppedRef.current) return;
 
-                // 1. Pick a slot
-                const pool = getPoolId();
-                const slot = Math.floor(Math.random() * MAX_SLOTS) + 1;
-                const targetId = `gw-nx-${pool}-${slot}`;
+                const pool = getPool();
+                // Pick a slot that isn't in ignore list (unless all are ignored, then reset)
+                let slot = Math.floor(Math.random() * MAX_SLOTS) + 1;
+                
+                // If we've failed on this slot recently, pick another
+                if (ignoreListRef.current.has(slot) && ignoreListRef.current.size < MAX_SLOTS) {
+                    while (ignoreListRef.current.has(slot)) {
+                        slot = Math.floor(Math.random() * MAX_SLOTS) + 1;
+                    }
+                } else if (ignoreListRef.current.size >= MAX_SLOTS) {
+                    ignoreListRef.current.clear(); // Clear cache if full
+                }
 
-                setScanText(`Scanning Freq ${slot}/${MAX_SLOTS}...`);
-                addLog(`Attempting to claim Slot: ${slot} in Pool: ${pool}`);
+                const id = `gw-v3-${pool}-${slot}`;
+                
+                setStatus(`Trying Freq ${slot}...`);
+                log(`Attempting Slot ${slot} (${pool})`);
 
-                // 2. Initialize Peer
-                const peer = new window.Peer(targetId, { debug: 0 });
+                const peer = new window.Peer(id, PEER_CONFIG);
 
-                peer.on('open', (id) => {
-                    // SUCCESS: We are the Host for this slot
-                    if (isManualStopRef.current) { peer.destroy(); return; }
-                    
+                peer.on('open', (peerId) => {
+                    if (isStoppedRef.current) return;
                     peerRef.current = peer;
-                    addLog(`Hosting Slot ${slot}. Waiting for peer...`, 'success');
-                    setScanText(`Hosting Freq ${slot}. Waiting...`);
+                    log(`HOSTING Slot ${slot}`, 'success');
+                    setStatus(`Hosting Freq ${slot}. Waiting...`);
 
-                    // Setup Host Listeners
                     peer.on('connection', (c) => handleConnection(c, true));
-                    peer.on('call', (call) => handleIncomingCall(call));
+                    peer.on('call', (c) => handleCall(c));
 
-                    // **AGGRESSIVE CYCLING**: If no one joins in X seconds, kill and retry
-                    hostTimeoutRef.current = setTimeout(() => {
-                        if (!connRef.current && !isManualStopRef.current) {
-                            addLog(`Timeout on Slot ${slot}. Re-rolling...`, 'warn');
-                            peer.destroy();
-                            attemptConnectionCycle(); // Recursion to try next slot
-                        }
+                    // Host Timeout: If no one joins, kill and move
+                    hostTimerRef.current = setTimeout(() => {
+                        log(`No one joined Slot ${slot}. Moving...`);
+                        peer.destroy();
+                        cycle();
                     }, HOST_TIMEOUT_MS);
                 });
 
                 peer.on('error', (err) => {
-                    // FAIL: ID is taken. Someone is already there!
                     if (err.type === 'unavailable-id') {
-                        addLog(`Slot ${slot} OCCUPIED! Attempting Connect...`, 'success');
-                        setScanText(`Found Signal in Slot ${slot}! Connecting...`);
-                        peer.destroy(); // Destroy our failed host attempt
-                        connectToHost(targetId); // Connect to the person waiting
-                    } else if (err.type === 'disconnected' || err.type === 'network') {
-                        addLog(`Network Error: ${err.type}. Retrying...`, 'error');
-                        setTimeout(attemptConnectionCycle, 2000);
+                        // Slot Taken -> Try to Connect
+                        log(`Slot ${slot} OCCUPIED. Connecting...`, 'warn');
+                        setStatus(`Signal found on Freq ${slot}! Connecting...`);
+                        peer.destroy();
+                        connectTo(id, slot);
                     } else {
-                        addLog(`Peer Error: ${err.type}`, 'error');
+                        log(`Peer Error: ${err.type}`);
+                        setTimeout(cycle, 1000);
                     }
                 });
             };
 
-            const connectToHost = (hostId) => {
-                if (isManualStopRef.current) return;
+            const connectTo = (targetId, slot) => {
+                const peer = new window.Peer(null, PEER_CONFIG);
                 
-                // Create a random client ID
-                const peer = new window.Peer(); 
-                
-                peer.on('open', (id) => {
+                peer.on('open', () => {
                     peerRef.current = peer;
-                    addLog(`Client initialized: ${id}`);
-                    addLog(`Dialing Host: ${hostId}...`);
+                    const conn = peer.connect(targetId, { reliable: true });
                     
-                    const conn = peer.connect(hostId);
-                    
-                    // Setup Client Listeners
-                    conn.on('open', () => handleConnection(conn, false));
-                    conn.on('close', () => {
-                        if (!connRef.current) {
-                            addLog('Host dropped before handshake. Retrying...', 'warn');
-                            // If we fail to connect to a "busy" slot, go back to searching
-                            setTimeout(attemptConnectionCycle, 1000);
-                        }
-                    });
-                    
-                    // Handle Calls
-                    peer.on('call', (call) => handleIncomingCall(call));
-
-                    // Safety Timeout: If connection hangs
-                    setTimeout(() => {
-                        if (!conn.open && !isManualStopRef.current && view === 'searching') {
-                            addLog('Connection timeout. Retrying...', 'error');
+                    // Critical: Zombie Killer Timer
+                    // If connection doesn't 'open' in X seconds, assume host is a ghost
+                    connectTimerRef.current = setTimeout(() => {
+                        if (!conn.open) {
+                            log(`Slot ${slot} is ZOMBIE (Timeout). Ignoring.`, 'error');
+                            ignoreListRef.current.add(slot); // Don't try this slot again for a bit
+                            conn.close();
                             peer.destroy();
-                            attemptConnectionCycle();
+                            cycle();
                         }
-                    }, 5000);
-                });
+                    }, CONNECT_TIMEOUT_MS);
 
+                    conn.on('open', () => {
+                        clearTimeout(connectTimerRef.current); // Safe!
+                        handleConnection(conn, false);
+                    });
+
+                    conn.on('error', (err) => {
+                         log(`Conn Error: ${err}`);
+                    });
+
+                    peer.on('call', (c) => handleCall(c));
+                });
+                
                 peer.on('error', (err) => {
-                    addLog(`Client Peer Error: ${err.type}`, 'error');
-                    setTimeout(attemptConnectionCycle, 2000);
+                     log(`Client Error: ${err.type}`);
+                     setTimeout(cycle, 1000);
                 });
             };
-
-            const cleanupConnection = () => {
-                if (hostTimeoutRef.current) clearTimeout(hostTimeoutRef.current);
-                if (callRef.current) callRef.current.close();
-                if (connRef.current) connRef.current.close();
-                if (peerRef.current) peerRef.current.destroy();
-                if (localStream) {
-                    localStream.getTracks().forEach(track => track.stop());
-                    setLocalStream(null);
-                }
-                setRemoteStream(null);
-                setCallActive(false);
-                connRef.current = null;
-                // Don't clear logs here so we can debug post-disconnect
-            };
-
-            // --- Handshake & Chat ---
 
             const handleConnection = (conn, amIHost) => {
-                if (hostTimeoutRef.current) clearTimeout(hostTimeoutRef.current); // Stop the cycling timer
+                if(hostTimerRef.current) clearTimeout(hostTimerRef.current);
                 connRef.current = conn;
-                
-                addLog(`Connection Open! Sending Handshake...`);
+                log('Connection Established!');
+                setView('connected');
+                setStatus('Connected');
 
-                // 1. Send Handshake
-                conn.send({
-                    type: 'handshake',
-                    payload: { age: myAge, gender: myGender }
-                });
+                // Send Handshake
+                conn.send({ type: 'handshake', data: { age: myAge, gender: myGender } });
 
-                conn.on('data', (data) => {
-                    if (data.type === 'handshake') {
-                        // 2. Validate Partner
-                        const { age, gender } = data.payload;
-                        addLog(`Handshake received: ${gender}, ${age}y/o`);
-                        
-                        const ageValid = age >= targetAgeMin && age <= targetAgeMax;
-                        const genderValid = targetGender === 'any' ? true : gender === targetGender;
-
-                        if (ageValid && genderValid) {
-                            setPartnerData({ age, gender });
-                            setView('connected');
-                            addSystemMsg(`Secure Link Established: ${gender}, ${age}y/o.`);
-                            addLog('Match Successful!', 'success');
+                conn.on('data', (d) => {
+                    if (d.type === 'handshake') {
+                        // Validate
+                        const valid = (targetGender === 'any' || d.data.gender === targetGender);
+                        if (valid) {
+                            addMsg(`Connected with ${d.data.gender} (${d.data.age})`, 'sys');
                         } else {
-                            addLog(`Criteria Fail. They are ${gender}/${age}. Disconnecting...`, 'warn');
-                            conn.send({ type: 'disconnect', reason: 'criteria' });
-                            conn.close();
-                            // Retry search
-                            setTimeout(attemptConnectionCycle, 1000);
+                            addMsg(`Match Criteria Failed. Disconnecting...`, 'sys');
+                            setTimeout(() => {
+                                conn.close();
+                                startSearch(); // Re-roll
+                            }, 2000);
                         }
-                    } else if (data.type === 'disconnect') {
-                        addLog('Partner disconnected or skipped.');
-                        cleanupConnection();
-                        if (!isManualStopRef.current) attemptConnectionCycle();
-                    } else if (data.type === 'msg') {
-                        addMessage(data.content, 'partner', 'text');
-                    } else if (data.type === 'file-data') {
-                        receiveFile(data);
+                    } else if (d.type === 'msg') {
+                        addMsg(d.content, 'them');
                     }
                 });
 
                 conn.on('close', () => {
-                    if (view === 'connected') {
-                        addSystemMsg('Stranger disconnected.');
-                        addLog('Connection closed.');
+                    if (!isStoppedRef.current && view === 'connected') {
+                        addMsg('Partner disconnected.', 'sys');
+                        setTimeout(startSearch, 2000);
                     }
                 });
             };
 
-            // --- Calls & Files (Same as before, condensed) ---
-            const startCall = async (video) => {
+            // --- Media & Chat ---
+            const startCall = async () => {
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ video, audio: true });
-                    setLocalStream(stream);
+                    const s = await navigator.mediaDevices.getUserMedia({video:true, audio:true});
+                    setLocalStream(s);
                     setCallActive(true);
-                    const call = peerRef.current.call(connRef.current.peer, stream);
+                    const call = peerRef.current.call(connRef.current.peer, s);
                     handleCallStream(call);
-                    addLog('Outgoing call initiated.');
-                } catch (err) { addLog('Media Error: ' + err.message, 'error'); }
+                } catch(e) { alert("Camera Error: " + e); }
             };
 
-            const handleIncomingCall = (call) => {
-                addLog('Incoming call received.');
-                if(confirm("Stranger requesting call. Accept?")) {
-                    navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(stream => {
-                        setLocalStream(stream);
+            const handleCall = (call) => {
+                if(confirm("Accept Video Call?")) {
+                    navigator.mediaDevices.getUserMedia({video:true, audio:true}).then(s => {
+                        setLocalStream(s);
                         setCallActive(true);
-                        call.answer(stream);
+                        call.answer(s);
                         handleCallStream(call);
                     });
                 } else { call.close(); }
@@ -337,184 +292,95 @@
                 call.on('close', () => { setCallActive(false); setRemoteStream(null); });
             };
 
-            const handleFileSelect = (e) => {
-                const file = e.target.files[0];
-                if (!file || file.size > FILE_LIMIT) return alert('File too large (Max 100MB)');
-                const reader = new FileReader();
-                reader.onload = (ev) => {
-                    const url = URL.createObjectURL(new Blob([ev.target.result], { type: file.type }));
-                    addMessage({ url, type: file.type, name: file.name }, 'me', 'file');
-                    connRef.current.send({ type: 'file-data', file: ev.target.result, mime: file.type, name: file.name });
-                    addLog(`Sent file: ${file.name}`);
-                };
-                reader.readAsArrayBuffer(file);
-            };
-
-            const receiveFile = (d) => {
-                const url = URL.createObjectURL(new Blob([d.file], { type: d.mime }));
-                addMessage({ url, type: d.mime, name: d.name }, 'partner', 'file');
-                addLog(`Received file: ${d.name}`);
-            };
-
-            const addMessage = (c, s, t='text') => setMessages(p => [...p, { id: Date.now()+Math.random(), content:c, sender:s, type:t }]);
-            const addSystemMsg = (t) => addMessage(t, 'system');
-            const sendMessage = (e) => {
+            const sendMsg = (e) => {
                 e.preventDefault();
-                const text = e.target.elements.msg.value.trim();
-                if(!text) return;
-                addMessage(text, 'me');
-                connRef.current.send({ type: 'msg', content: text });
-                e.target.elements.msg.value = '';
+                const txt = e.target.msg.value;
+                if(!txt) return;
+                addMsg(txt, 'me');
+                connRef.current.send({type: 'msg', content: txt});
+                e.target.msg.value = '';
             };
 
-            // --- Components ---
-            const DebugConsole = () => (
-                <div className={`fixed top-0 right-0 h-full w-80 bg-black/95 border-l border-green-500/30 p-4 z-[100] font-mono text-xs overflow-hidden flex flex-col transition-transform transform ${showConsole ? 'translate-x-0' : 'translate-x-full'}`}>
-                    <div className="flex justify-between items-center border-b border-zinc-800 pb-2 mb-2">
-                        <span className="text-green-500 font-bold">NET_RUNNER_LOGS</span>
-                        <button onClick={() => setShowConsole(false)} className="text-zinc-500 hover:text-white">X</button>
-                    </div>
-                    <div className="flex-1 overflow-y-auto space-y-1">
-                        {logs.map((l, i) => (
-                            <div key={i} className={`break-words ${l.includes('error') ? 'text-red-400' : l.includes('success') ? 'text-green-400' : l.includes('warn') ? 'text-yellow-400' : 'text-zinc-500'}`}>
-                                {l}
+            const addMsg = (text, sender) => setMessages(p => [...p, {id: Date.now()+Math.random(), text, sender}]);
+
+            // --- UI ---
+            if (view === 'setup') return (
+                <div className="min-h-screen bg-zinc-950 flex items-center justify-center p-4">
+                    <div className="w-full max-w-md glass p-6 rounded-2xl space-y-6">
+                        <div className="text-center">
+                            <h1 className="text-2xl font-bold text-white tracking-tighter">GHOSTWIRE <span className="text-green-500">v3</span></h1>
+                            <p className="text-zinc-500 text-xs mono">STABLE CONNECTIVITY</p>
+                        </div>
+                        <div className="bg-zinc-900 p-4 rounded-xl space-y-4 border border-zinc-800">
+                            <div className="flex justify-between items-center">
+                                <span className="text-xs font-bold text-zinc-400">I AM</span>
+                                <div className="flex gap-2">
+                                    {['M','F'].map(g => <button key={g} onClick={()=>setMyGender(g)} className={`w-10 h-10 rounded font-bold ${myGender===g?'bg-green-600 text-white':'bg-zinc-800 text-zinc-500'}`}>{g}</button>)}
+                                </div>
                             </div>
-                        ))}
-                    </div>
-                    <div className="mt-2 pt-2 border-t border-zinc-800">
-                        <div className="text-[10px] text-zinc-600">ID: {peerRef.current?.id || 'null'}</div>
-                        <div className="text-[10px] text-zinc-600">State: {view}</div>
+                            <div className="flex justify-between items-center">
+                                <span className="text-xs font-bold text-zinc-400">FINDING</span>
+                                <div className="flex gap-2">
+                                    {['M','F','any'].map(g => <button key={g} onClick={()=>setTargetGender(g)} className={`h-10 px-3 rounded font-bold text-xs uppercase ${targetGender===g?'bg-green-600/20 text-green-400 border border-green-600':'bg-zinc-800 text-zinc-500'}`}>{g}</button>)}
+                                </div>
+                            </div>
+                        </div>
+                        <button onClick={startSearch} className="w-full bg-white text-black font-bold py-4 rounded-xl hover:bg-zinc-200 transition-all">START SEARCH</button>
                     </div>
                 </div>
             );
 
-            // --- Render ---
+            if (view === 'searching') return (
+                <div className="min-h-screen bg-black flex flex-col items-center justify-center p-4 relative">
+                    <div className="absolute top-4 right-4 w-64 max-h-48 overflow-y-auto text-[10px] mono text-zinc-600 bg-zinc-900/50 p-2 rounded pointer-events-none">
+                        {logs.map((l,i)=><div key={i}>{l}</div>)}
+                    </div>
+                    <div className="relative mb-8">
+                        <div className="absolute inset-0 bg-green-500/20 blur-xl rounded-full animate-pulse"></div>
+                        <Icon name="loader-2" size={48} className="text-green-500 animate-spin relative z-10" />
+                    </div>
+                    <h2 className="text-green-500 mono text-sm animate-pulse">{status}</h2>
+                    <button onClick={() => { isStoppedRef.current=true; setView('setup'); }} className="mt-8 text-zinc-500 text-xs underline">CANCEL</button>
+                </div>
+            );
 
             return (
-                <div className="h-screen w-full bg-black relative">
-                    <DebugConsole />
+                <div className="h-screen flex flex-col bg-black">
+                    {callActive && (
+                        <div className="absolute inset-0 bg-black z-50">
+                            <div className="video-grid">
+                                <video ref={remoteVideoRef} autoPlay playsInline className="remote-video" />
+                                <video ref={localVideoRef} autoPlay playsInline muted className="local-video" />
+                            </div>
+                            <button onClick={()=>setCallActive(false)} className="absolute bottom-8 left-1/2 -translate-x-1/2 bg-red-600 p-4 rounded-full shadow-xl"><Icon name="phone-off" color="white" /></button>
+                        </div>
+                    )}
                     
-                    {/* Console Toggle */}
-                    <button onClick={() => setShowConsole(!showConsole)} className="fixed top-4 right-4 z-[60] p-2 bg-black/50 hover:bg-black text-green-500 border border-green-500/30 rounded-full transition-all">
-                        <Icon name="terminal" size={16} />
-                    </button>
-
-                    {/* SETUP VIEW */}
-                    {view === 'setup' && (
-                        <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-zinc-900 to-black">
-                            <div className="w-full max-w-md glass rounded-2xl p-8 space-y-6 animate-fade-in">
-                                <div className="text-center">
-                                    <h1 className="text-3xl font-bold text-white tracking-tighter">GHOST<span className="text-green-500">WIRE</span> v2</h1>
-                                    <p className="text-zinc-500 text-xs mono mt-1">DEBUG MODE ACTIVE</p>
-                                </div>
-                                {/* Simplified Inputs */}
-                                <div className="space-y-4">
-                                    <div className="flex justify-between items-center bg-zinc-800/50 p-3 rounded-lg">
-                                        <span className="text-xs font-bold text-zinc-400">MY GENDER</span>
-                                        <div className="flex gap-2">
-                                            {['M','F'].map(g => (
-                                                <button key={g} onClick={() => setMyGender(g)} className={`w-8 h-8 rounded flex items-center justify-center font-bold text-sm ${myGender===g ? 'bg-green-600 text-white':'bg-zinc-700 text-zinc-400'}`}>{g}</button>
-                                            ))}
-                                        </div>
-                                    </div>
-                                    <div className="flex justify-between items-center bg-zinc-800/50 p-3 rounded-lg">
-                                        <span className="text-xs font-bold text-zinc-400">MY AGE</span>
-                                        <input type="number" value={myAge} onChange={e=>setMyAge(Number(e.target.value))} className="w-16 bg-zinc-900 border border-zinc-700 rounded p-1 text-center text-white" />
-                                    </div>
-                                    <div className="border-t border-zinc-800 pt-4">
-                                        <div className="flex justify-between items-center mb-2">
-                                            <span className="text-xs font-bold text-green-500">FIND GENDER</span>
-                                            <div className="flex gap-1">
-                                                {['M','F','any'].map(g => (
-                                                    <button key={g} onClick={() => setTargetGender(g)} className={`px-2 py-1 rounded text-xs font-bold uppercase ${targetGender===g ? 'bg-green-500/20 text-green-400 border border-green-500/50':'bg-zinc-800 text-zinc-500'}`}>{g}</button>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                                <button onClick={startSearch} className="w-full bg-white hover:bg-gray-200 text-black font-bold py-4 rounded-xl transition-all active:scale-95">INITIATE CONNECTION</button>
-                            </div>
+                    <div className="h-14 border-b border-zinc-800 flex items-center justify-between px-4 bg-zinc-900/90">
+                        <div className="flex items-center gap-2">
+                            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                            <span className="font-bold text-sm">Anonymous</span>
                         </div>
-                    )}
-
-                    {/* SEARCHING VIEW */}
-                    {view === 'searching' && (
-                        <div className="h-full flex flex-col items-center justify-center relative">
-                            <div className="w-48 h-48 border border-green-500/20 rounded-full flex items-center justify-center relative">
-                                <div className="absolute inset-0 border-t-2 border-green-500 rounded-full animate-spin"></div>
-                                <div className="text-center z-10">
-                                    <Icon name="radar" size={32} className="text-green-500 mx-auto mb-2" />
-                                    <p className="text-xs mono text-green-400">{scanText}</p>
-                                </div>
-                            </div>
-                            <button onClick={stopSearch} className="mt-8 text-zinc-500 hover:text-white text-sm underline z-10">ABORT</button>
-                            <p className="absolute bottom-10 text-zinc-600 text-[10px] mono">Open Console (Top Right) to view logs</p>
+                        <div className="flex gap-3">
+                            <button onClick={startCall} className="text-zinc-400 hover:text-white"><Icon name="video" /></button>
+                            <button onClick={startSearch} className="bg-zinc-800 text-xs font-bold px-3 py-1.5 rounded text-white border border-zinc-700">SKIP</button>
                         </div>
-                    )}
+                    </div>
 
-                    {/* CHAT VIEW */}
-                    {view === 'connected' && (
-                        <div className="h-full flex flex-col bg-black">
-                            {/* Video Layer */}
-                            {callActive && (
-                                <div className="absolute inset-0 z-40 bg-black">
-                                    <div className="video-grid">
-                                        <video ref={remoteVideoRef} autoPlay playsInline className="remote-video" />
-                                        <video ref={localVideoRef} autoPlay playsInline muted className="local-video" />
-                                    </div>
-                                    <div className="absolute bottom-8 w-full flex justify-center z-50">
-                                        <button onClick={()=>setCallActive(false)} className="bg-red-500 p-4 rounded-full shadow-lg"><Icon name="phone-off" color="white" /></button>
-                                    </div>
-                                </div>
-                            )}
-                            
-                            {/* Header */}
-                            <div className="h-14 border-b border-zinc-800 flex items-center justify-between px-4 bg-zinc-900/80 backdrop-blur z-30">
-                                <div className="flex items-center gap-3">
-                                    <div className="w-8 h-8 rounded bg-green-900/50 flex items-center justify-center text-green-400 font-bold text-xs border border-green-500/30">{partnerData?.gender}</div>
-                                    <div>
-                                        <div className="font-bold text-sm text-white">Stranger <span className="text-zinc-500 font-normal">({partnerData?.age})</span></div>
-                                        <div className="text-[10px] text-green-500 mono">ENCRYPTED CONNECTION</div>
-                                    </div>
-                                </div>
-                                <div className="flex gap-2">
-                                    <button onClick={()=>startCall(false)} className="p-2 bg-zinc-800 rounded-full hover:bg-zinc-700"><Icon name="phone" size={16} /></button>
-                                    <button onClick={()=>startCall(true)} className="p-2 bg-zinc-800 rounded-full hover:bg-zinc-700"><Icon name="video" size={16} /></button>
-                                    <button onClick={startSearch} className="px-3 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs font-bold hover:bg-zinc-700 ml-2">SKIP</button>
+                    <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                        {messages.map(m => (
+                            <div key={m.id} className={`flex ${m.sender==='me'?'justify-end':m.sender==='sys'?'justify-center':'justify-start'} msg-enter`}>
+                                <div className={`max-w-[80%] p-3 rounded-2xl text-sm ${m.sender==='me'?'bg-green-600 text-white rounded-br-sm':m.sender==='sys'?'bg-zinc-900 text-zinc-500 text-xs':'bg-zinc-800 text-zinc-200 rounded-bl-sm'}`}>
+                                    {m.text}
                                 </div>
                             </div>
+                        ))}
+                    </div>
 
-                            {/* Messages */}
-                            <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-4 space-y-3 z-20 relative">
-                                {messages.map(m => (
-                                    <div key={m.id} className={`flex ${m.sender==='me'?'justify-end':'justify-start'} ${m.sender==='system'?'justify-center':''} msg-enter`}>
-                                        {m.sender === 'system' ? (
-                                            <span className="text-[10px] text-zinc-600 bg-zinc-900 px-2 py-1 rounded border border-zinc-800">{m.content}</span>
-                                        ) : (
-                                            <div className={`max-w-[80%] p-3 rounded-2xl ${m.sender==='me'?'bg-white text-black rounded-br-none':'bg-zinc-800 text-white rounded-bl-none'}`}>
-                                                {m.type==='text' && <p className="text-sm font-medium">{m.content}</p>}
-                                                {m.type==='file' && (
-                                                    <div>
-                                                        {m.content.type.includes('image') ? <img src={m.content.url} className="rounded" /> : <div className="flex items-center gap-2"><Icon name="file" size={16}/> <span className="text-xs underline">{m.content.name}</span></div>}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
-
-                            {/* Input */}
-                            <div className="p-3 bg-zinc-900 border-t border-zinc-800 z-30">
-                                <form onSubmit={sendMessage} className="flex gap-2">
-                                    <input type="file" ref={fileInputRef} className="hidden" onChange={handleFileSelect} />
-                                    <button type="button" onClick={()=>fileInputRef.current?.click()} className="p-3 bg-zinc-800 rounded-xl text-zinc-400 hover:text-white"><Icon name="paperclip" /></button>
-                                    <input name="msg" type="text" placeholder="Message..." className="flex-1 bg-black border border-zinc-700 rounded-xl px-4 text-sm text-white focus:border-green-500 focus:outline-none" autoComplete="off" />
-                                    <button type="submit" className="p-3 bg-green-600 rounded-xl text-black font-bold hover:bg-green-500"><Icon name="send" /></button>
-                                </form>
-                            </div>
-                        </div>
-                    )}
+                    <form onSubmit={sendMsg} className="p-3 bg-zinc-900 border-t border-zinc-800 flex gap-2">
+                        <input name="msg" placeholder="Message..." className="flex-1 bg-black border border-zinc-700 rounded-xl px-4 text-sm focus:outline-none focus:border-green-600 text-white" autoComplete="off" />
+                        <button className="p-3 bg-green-600 rounded-xl text-black hover:bg-green-500"><Icon name="send" size={18}/></button>
+                    </form>
                 </div>
             );
         };
